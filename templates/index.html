@@ -1,10 +1,748 @@
+# AI Code Review Assistant
+# A modern web application that analyzes code quality, detects issues, and provides AI-powered suggestions
+
+from flask import Flask, render_template, request, jsonify, send_from_directory
+import os
+import ast
+import re
+import json
+from datetime import datetime
+import sqlite3
+import hashlib
+import subprocess
+from typing import Dict, List, Tuple, Any
+import requests
+from dataclasses import dataclass
+from flask_cors import CORS
+
+app = Flask(__name__)
+CORS(app)
+
+# Database setup
+def init_db():
+    conn = sqlite3.connect('code_reviews.db')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS reviews (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_hash TEXT UNIQUE,
+            filename TEXT,
+            language TEXT,
+            issues_count INTEGER,
+            complexity_score REAL,
+            maintainability_score REAL,
+            review_data TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+init_db()
+
+@dataclass
+class CodeIssue:
+    type: str
+    severity: str
+    line: int
+    message: str
+    suggestion: str
+
+@dataclass
+class CodeMetrics:
+    complexity: float
+    maintainability: float
+    lines_of_code: int
+    functions_count: int
+    classes_count: int
+
+class PythonCodeAnalyzer:
+    def __init__(self):
+        self.issues = []
+        self.metrics = CodeMetrics(0, 0, 0, 0, 0)
+    
+    def analyze(self, code: str) -> Tuple[List[CodeIssue], CodeMetrics]:
+        self.issues = []
+        try:
+            tree = ast.parse(code)
+            self._analyze_ast(tree)
+            self._analyze_patterns(code)
+            self._calculate_metrics(code, tree)
+        except SyntaxError as e:
+            self.issues.append(CodeIssue(
+                type="syntax_error",
+                severity="critical",
+                line=e.lineno or 1,
+                message=f"Syntax error: {e.msg}",
+                suggestion="Fix the syntax error before proceeding"
+            ))
+        
+        return self.issues, self.metrics
+    
+    def _analyze_ast(self, tree):
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef):
+                self._check_function_complexity(node)
+                self._check_function_naming(node)
+            elif isinstance(node, ast.ClassDef):
+                self._check_class_naming(node)
+            elif isinstance(node, ast.Import) or isinstance(node, ast.ImportFrom):
+                self._check_imports(node)
+    
+    def _check_function_complexity(self, node):
+        complexity = self._calculate_cyclomatic_complexity(node)
+        if complexity > 10:
+            self.issues.append(CodeIssue(
+                type="complexity",
+                severity="high",
+                line=node.lineno,
+                message=f"Function '{node.name}' has high cyclomatic complexity ({complexity})",
+                suggestion="Consider breaking this function into smaller, more focused functions"
+            ))
+    
+    def _check_function_naming(self, node):
+        if not re.match(r'^[a-z_][a-z0-9_]*$', node.name):
+            self.issues.append(CodeIssue(
+                type="naming",
+                severity="medium",
+                line=node.lineno,
+                message=f"Function '{node.name}' doesn't follow snake_case naming convention",
+                suggestion="Use snake_case for function names (e.g., 'my_function')"
+            ))
+    
+    def _check_class_naming(self, node):
+        if not re.match(r'^[A-Z][a-zA-Z0-9]*$', node.name):
+            self.issues.append(CodeIssue(
+                type="naming",
+                severity="medium",
+                line=node.lineno,
+                message=f"Class '{node.name}' doesn't follow PascalCase naming convention",
+                suggestion="Use PascalCase for class names (e.g., 'MyClass')"
+            ))
+    
+    def _check_imports(self, node):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == '*':
+                    self.issues.append(CodeIssue(
+                        type="import",
+                        severity="medium",
+                        line=node.lineno,
+                        message="Avoid wildcard imports",
+                        suggestion="Import specific functions/classes instead of using '*'"
+                    ))
+    
+    def _analyze_patterns(self, code):
+        lines = code.split('\n')
+        for i, line in enumerate(lines, 1):
+            # Check for TODO comments
+            if 'TODO' in line:
+                self.issues.append(CodeIssue(
+                    type="todo",
+                    severity="low",
+                    line=i,
+                    message="TODO comment found",
+                    suggestion="Consider addressing this TODO or creating a proper issue"
+                ))
+            
+            # Check for long lines
+            if len(line) > 100:
+                self.issues.append(CodeIssue(
+                    type="style",
+                    severity="low",
+                    line=i,
+                    message="Line too long (>100 characters)",
+                    suggestion="Break long lines for better readability"
+                ))
+    
+    def _calculate_cyclomatic_complexity(self, node):
+        complexity = 1
+        for child in ast.walk(node):
+            if isinstance(child, (ast.If, ast.While, ast.For, ast.ExceptHandler)):
+                complexity += 1
+            elif isinstance(child, ast.BoolOp):
+                complexity += len(child.values) - 1
+        return complexity
+    
+    def _calculate_metrics(self, code, tree):
+        lines = [line.strip() for line in code.split('\n') if line.strip()]
+        self.metrics.lines_of_code = len(lines)
+        
+        functions = [node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)]
+        classes = [node for node in ast.walk(tree) if isinstance(node, ast.ClassDef)]
+        
+        self.metrics.functions_count = len(functions)
+        self.metrics.classes_count = len(classes)
+        
+        # Calculate complexity score (0-100, higher is more complex)
+        total_complexity = sum(self._calculate_cyclomatic_complexity(f) for f in functions)
+        avg_complexity = total_complexity / max(len(functions), 1)
+        self.metrics.complexity = min(avg_complexity * 10, 100)
+        
+        # Calculate maintainability score (0-100, higher is better)
+        issue_penalty = len(self.issues) * 2
+        maintainability = max(100 - issue_penalty - (avg_complexity * 5), 0)
+        self.metrics.maintainability = maintainability
+
+class AICodeSuggester:
+    def __init__(self):
+        self.suggestions_db = {
+            "complexity": [
+                "Extract smaller functions from complex logic",
+                "Use early returns to reduce nesting",
+                "Consider using design patterns like Strategy or Factory",
+                "Break down conditional logic into separate functions"
+            ],
+            "naming": [
+                "Use descriptive names that explain the purpose",
+                "Follow PEP 8 naming conventions",
+                "Avoid abbreviations unless they're widely known",
+                "Use verbs for functions and nouns for classes"
+            ],
+            "performance": [
+                "Use list comprehensions instead of loops where appropriate",
+                "Consider caching results for expensive operations",
+                "Use generators for large datasets",
+                "Profile your code to identify bottlenecks"
+            ]
+        }
+    
+    def get_suggestions(self, issues: List[CodeIssue]) -> List[str]:
+        suggestions = []
+        issue_types = set(issue.type for issue in issues)
+        
+        for issue_type in issue_types:
+            if issue_type in self.suggestions_db:
+                suggestions.extend(self.suggestions_db[issue_type])
+        
+        # Add general suggestions
+        if len(issues) > 5:
+            suggestions.append("Consider refactoring this code to improve overall quality")
+        
+        return list(set(suggestions))  # Remove duplicates
+
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+@app.route('/api/analyze', methods=['POST'])
+def analyze_code():
+    data = request.json
+    code = data.get('code', '')
+    filename = data.get('filename', 'untitled.py')
+    language = data.get('language', 'python')
+    
+    if not code:
+        return jsonify({'error': 'No code provided'}), 400
+    
+    # Generate hash for caching
+    code_hash = hashlib.md5(code.encode()).hexdigest()
+    
+    # Check if already analyzed
+    conn = sqlite3.connect('code_reviews.db')
+    existing = conn.execute(
+        'SELECT review_data FROM reviews WHERE file_hash = ?',
+        (code_hash,)
+    ).fetchone()
+    
+    if existing:
+        conn.close()
+        return jsonify(json.loads(existing[0]))
+    
+    # Analyze code
+    analyzer = PythonCodeAnalyzer()
+    issues, metrics = analyzer.analyze(code)
+    
+    # Get AI suggestions
+    ai_suggester = AICodeSuggester()
+    suggestions = ai_suggester.get_suggestions(issues)
+    
+    # Prepare response
+    response = {
+        'issues': [
+            {
+                'type': issue.type,
+                'severity': issue.severity,
+                'line': issue.line,
+                'message': issue.message,
+                'suggestion': issue.suggestion
+            } for issue in issues
+        ],
+        'metrics': {
+            'complexity': metrics.complexity,
+            'maintainability': metrics.maintainability,
+            'lines_of_code': metrics.lines_of_code,
+            'functions_count': metrics.functions_count,
+            'classes_count': metrics.classes_count
+        },
+        'suggestions': suggestions,
+        'summary': {
+            'total_issues': len(issues),
+            'critical_issues': len([i for i in issues if i.severity == 'critical']),
+            'high_issues': len([i for i in issues if i.severity == 'high']),
+            'medium_issues': len([i for i in issues if i.severity == 'medium']),
+            'low_issues': len([i for i in issues if i.severity == 'low'])
+        }
+    }
+    
+    # Save to database
+    conn.execute('''
+        INSERT OR REPLACE INTO reviews 
+        (file_hash, filename, language, issues_count, complexity_score, maintainability_score, review_data)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    ''', (
+        code_hash, filename, language, len(issues),
+        metrics.complexity, metrics.maintainability, json.dumps(response)
+    ))
+    conn.commit()
+    conn.close()
+    
+    return jsonify(response)
+
+@app.route('/api/history')
+def get_history():
+    conn = sqlite3.connect('code_reviews.db')
+    reviews = conn.execute('''
+        SELECT filename, language, issues_count, complexity_score, 
+               maintainability_score, created_at
+        FROM reviews 
+        ORDER BY created_at DESC 
+        LIMIT 50
+    ''').fetchall()
+    conn.close()
+    
+    return jsonify([{
+        'filename': r[0],
+        'language': r[1],
+        'issues_count': r[2],
+        'complexity_score': r[3],
+        'maintainability_score': r[4],
+        'created_at': r[5]
+    } for r in reviews])
+
+@app.route('/api/stats')
+def get_stats():
+    conn = sqlite3.connect('code_reviews.db')
+    stats = conn.execute('''
+        SELECT 
+            COUNT(*) as total_reviews,
+            AVG(complexity_score) as avg_complexity,
+            AVG(maintainability_score) as avg_maintainability,
+            AVG(issues_count) as avg_issues
+        FROM reviews
+    ''').fetchone()
+    conn.close()
+    
+    return jsonify({
+        'total_reviews': stats[0],
+        'avg_complexity': round(stats[1] or 0, 2),
+        'avg_maintainability': round(stats[2] or 0, 2),
+        'avg_issues': round(stats[3] or 0, 2)
+    })
+
+# HTML Template
+html_template = '''
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>AI Code Review Assistant</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            color: #333;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        
+        .header {
+            text-align: center;
+            color: white;
+            margin-bottom: 30px;
+        }
+        
+        .header h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+        }
+        
+        .header p {
+            font-size: 1.2em;
+            opacity: 0.9;
+        }
+        
+        .main-content {
+            background: white;
+            border-radius: 20px;
+            padding: 30px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+        }
+        
+        .input-section {
+            margin-bottom: 30px;
+        }
+        
+        .input-group {
+            margin-bottom: 20px;
+        }
+        
+        .input-group label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: 600;
+            color: #555;
+        }
+        
+        .input-group input {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #e1e1e1;
+            border-radius: 8px;
+            font-size: 16px;
+            transition: border-color 0.3s;
+        }
+        
+        .input-group input:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        
+        .code-input {
+            width: 100%;
+            min-height: 300px;
+            padding: 15px;
+            border: 2px solid #e1e1e1;
+            border-radius: 8px;
+            font-family: 'Consolas', 'Monaco', monospace;
+            font-size: 14px;
+            resize: vertical;
+        }
+        
+        .analyze-btn {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 15px 30px;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            cursor: pointer;
+            transition: transform 0.2s;
+        }
+        
+        .analyze-btn:hover {
+            transform: translateY(-2px);
+        }
+        
+        .analyze-btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+        
+        .results {
+            margin-top: 30px;
+            display: none;
+        }
+        
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        
+        .metric-card {
+            background: #f8f9fa;
+            padding: 20px;
+            border-radius: 12px;
+            text-align: center;
+        }
+        
+        .metric-value {
+            font-size: 2em;
+            font-weight: bold;
+            color: #667eea;
+        }
+        
+        .metric-label {
+            color: #666;
+            margin-top: 5px;
+        }
+        
+        .issues-section {
+            margin-top: 30px;
+        }
+        
+        .issue-item {
+            background: #fff;
+            border: 1px solid #e1e1e1;
+            border-radius: 8px;
+            padding: 15px;
+            margin-bottom: 15px;
+            border-left: 4px solid #667eea;
+        }
+        
+        .issue-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+        
+        .issue-type {
+            background: #667eea;
+            color: white;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            text-transform: uppercase;
+        }
+        
+        .issue-severity {
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: bold;
+        }
+        
+        .severity-critical { background: #dc3545; color: white; }
+        .severity-high { background: #fd7e14; color: white; }
+        .severity-medium { background: #ffc107; color: black; }
+        .severity-low { background: #28a745; color: white; }
+        
+        .issue-line {
+            font-size: 12px;
+            color: #666;
+            margin-bottom: 10px;
+        }
+        
+        .issue-message {
+            font-weight: 600;
+            margin-bottom: 5px;
+        }
+        
+        .issue-suggestion {
+            color: #666;
+            font-style: italic;
+        }
+        
+        .suggestions-section {
+            margin-top: 30px;
+            background: #f8f9fa;
+            padding: 20px;
+            border-radius: 12px;
+        }
+        
+        .suggestions-section h3 {
+            margin-bottom: 15px;
+            color: #667eea;
+        }
+        
+        .suggestion-item {
+            background: white;
+            padding: 10px;
+            border-radius: 6px;
+            margin-bottom: 8px;
+            border-left: 3px solid #667eea;
+        }
+        
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #666;
+        }
+        
+        .spinner {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #667eea;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 20px;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
 </head>
 <body>
-    <h1>Welcome to AI Code Review Assistant</h1>
+    <div class="container">
+        <div class="header">
+            <h1>🤖 AI Code Review Assistant</h1>
+            <p>Analyze your code quality with AI-powered insights</p>
+        </div>
+        
+        <div class="main-content">
+            <div class="input-section">
+                <div class="input-group">
+                    <label for="filename">Filename:</label>
+                    <input type="text" id="filename" placeholder="example.py" value="example.py">
+                </div>
+                
+                <div class="input-group">
+                    <label for="code">Python Code:</label>
+                    <textarea id="code" class="code-input" placeholder="Paste your Python code here..."></textarea>
+                </div>
+                
+                <button class="analyze-btn" onclick="analyzeCode()">
+                    🔍 Analyze Code
+                </button>
+            </div>
+            
+            <div id="loading" class="loading" style="display: none;">
+                <div class="spinner"></div>
+                <p>Analyzing your code...</p>
+            </div>
+            
+            <div id="results" class="results">
+                <div id="metrics" class="metrics-grid"></div>
+                <div id="issues" class="issues-section"></div>
+                <div id="suggestions" class="suggestions-section"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        async function analyzeCode() {
+            const code = document.getElementById('code').value;
+            const filename = document.getElementById('filename').value;
+            
+            if (!code.trim()) {
+                alert('Please enter some code to analyze');
+                return;
+            }
+            
+            document.getElementById('loading').style.display = 'block';
+            document.getElementById('results').style.display = 'none';
+            document.querySelector('.analyze-btn').disabled = true;
+            
+            try {
+                const response = await fetch('/api/analyze', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        code: code,
+                        filename: filename,
+                        language: 'python'
+                    })
+                });
+                
+                const data = await response.json();
+                displayResults(data);
+                
+            } catch (error) {
+                alert('Error analyzing code: ' + error.message);
+            } finally {
+                document.getElementById('loading').style.display = 'none';
+                document.querySelector('.analyze-btn').disabled = false;
+            }
+        }
+        
+        function displayResults(data) {
+            // Display metrics
+            const metrics = data.metrics;
+            const metricsHtml = `
+                <div class="metric-card">
+                    <div class="metric-value">${metrics.complexity.toFixed(1)}</div>
+                    <div class="metric-label">Complexity Score</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-value">${metrics.maintainability.toFixed(1)}</div>
+                    <div class="metric-label">Maintainability</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-value">${metrics.lines_of_code}</div>
+                    <div class="metric-label">Lines of Code</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-value">${data.summary.total_issues}</div>
+                    <div class="metric-label">Total Issues</div>
+                </div>
+            `;
+            document.getElementById('metrics').innerHTML = metricsHtml;
+            
+            // Display issues
+            const issuesHtml = data.issues.map(issue => `
+                <div class="issue-item">
+                    <div class="issue-header">
+                        <span class="issue-type">${issue.type}</span>
+                        <span class="issue-severity severity-${issue.severity}">${issue.severity}</span>
+                    </div>
+                    <div class="issue-line">Line ${issue.line}</div>
+                    <div class="issue-message">${issue.message}</div>
+                    <div class="issue-suggestion">${issue.suggestion}</div>
+                </div>
+            `).join('');
+            
+            document.getElementById('issues').innerHTML = 
+                `<h3>🔍 Issues Found (${data.summary.total_issues})</h3>` + 
+                (issuesHtml || '<p>No issues found! Great job! 🎉</p>');
+            
+            // Display suggestions
+            const suggestionsHtml = data.suggestions.map(suggestion => `
+                <div class="suggestion-item">💡 ${suggestion}</div>
+            `).join('');
+            
+            document.getElementById('suggestions').innerHTML = `
+                <h3>💡 AI Suggestions</h3>
+                ${suggestionsHtml || '<p>No specific suggestions at this time.</p>'}
+            `;
+            
+            document.getElementById('results').style.display = 'block';
+        }
+        
+        // Sample code for demo
+        document.getElementById('code').value = `def calculate_fibonacci(n):
+    if n <= 1:
+        return n
+    else:
+        return calculate_fibonacci(n-1) + calculate_fibonacci(n-2)
+
+class MyClass:
+    def __init__(self):
+        self.value = 0
+    
+    def update_value(self, new_value):
+        # TODO: Add validation
+        self.value = new_value
+        return self.value
+
+# This is a very long line that exceeds the recommended length and should be broken down for better readability
+result = calculate_fibonacci(10)
+print(result)`;
+    </script>
 </body>
 </html>
+'''
+
+# Create templates directory and save HTML
+os.makedirs('templates', exist_ok=True)
+with open('templates/index.html', 'w') as f:
+    f.write(html_template)
+
+if __name__ == '__main__':
+    print("🚀 AI Code Review Assistant starting...")
+    print("📊 Features:")
+    print("   • Real-time code analysis")
+    print("   • AI-powered suggestions")
+    print("   • Quality metrics calculation")
+    print("   • Review history tracking")
+    print("   • Modern web interface")
+    print("\n🌐 Open http://localhost:5000 in your browser")
+    app.run(debug=True, host='0.0.0.0', port=5000)
